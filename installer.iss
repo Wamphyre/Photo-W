@@ -4,7 +4,7 @@
 #define MyAppExeName "Photo-W.exe"
 
 [Setup]
-AppId={{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
+AppId={{8FE86485-9BF5-4A0C-89E1-D1A7A13DF6FD}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
