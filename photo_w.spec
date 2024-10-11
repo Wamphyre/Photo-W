@@ -20,7 +20,9 @@ a = Analysis(
     hiddenimports=[
         'ttkbootstrap',
         *ttkbootstrap_submodules,
-        'PIL._tkinter_finder'
+        'PIL._tkinter_finder',
+        'win32api',
+        'win32com.client',
     ],
     hookspath=[],
     hooksconfig={},
@@ -34,6 +36,10 @@ a = Analysis(
 
 # Excluir archivos innecesarios de opencv
 a.binaries = [x for x in a.binaries if not x[0].startswith("opencv_videoio")]
+
+# Asegurarse de incluir los DLLs necesarios para win32api
+a.binaries += [('win32api.pyd', 'C:\\Windows\\System32\\win32api.pyd', 'BINARY')]
+a.binaries += [('win32com.shell.shell.pyd', 'C:\\Windows\\System32\\win32com.shell.shell.pyd', 'BINARY')]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 

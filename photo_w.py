@@ -15,8 +15,29 @@ import subprocess
 import tempfile
 import re
 from typing import Optional, Tuple
+import win32api
 
-VERSION = "1.2"
+VERSION = "1.2.0"
+
+def get_windows_file_version(filename):
+    info = win32api.GetFileVersionInfo(filename, "\\")
+    ms = info['FileVersionMS']
+    ls = info['FileVersionLS']
+    return f"{HIWORD(ms)}.{LOWORD(ms)}.{HIWORD(ls)}.{LOWORD(ls)}"
+
+def HIWORD(x):
+    return (x >> 16) & 0xffff
+
+def LOWORD(x):
+    return x & 0xffff
+
+def check_current_version():
+    try:
+        current_version = get_windows_file_version(sys.executable)
+        if current_version != VERSION:
+            print(f"Advertencia: La versión del ejecutable ({current_version}) no coincide con la versión declarada ({VERSION})")
+    except Exception as e:
+        print(f"Error al verificar la versión: {e}")
 
 class UpdateSystem:
     def __init__(self, current_version: str):
@@ -78,8 +99,15 @@ class UpdateSystem:
 
     def install_update(self, update_file: str) -> None:
         if sys.platform.startswith('win'):
-            subprocess.Popen([update_file], shell=True)
-            sys.exit()
+            try:
+                ctypes.windll.shell32.ShellExecuteW(None, "runas", update_file, None, None, 1)
+                self.exit_application()
+            except Exception as e:
+                print(f"Error al iniciar la actualización: {e}")
+                messagebox.showerror("Error", "No se pudo iniciar la actualización. Por favor, inténtelo manualmente.")
+
+    def exit_application(self):
+        sys.exit()
 
 class ImageProcessor:
     def __init__(self):
@@ -149,6 +177,8 @@ class PhotoW:
         self.master = master
         self.master.title(f"Photo-W v{VERSION}")
         self.master.geometry("1000x600")
+        
+        check_current_version()
         
         if self._check_for_update():
             return

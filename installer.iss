@@ -1,5 +1,5 @@
 #define MyAppName "Photo-W"
-#define MyAppVersion "1.2"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Wamphyre"
 #define MyAppURL "https://github.com/Wamphyre/Photo-W"
 #define MyAppExeName "Photo-W.exe"
@@ -67,5 +67,25 @@ begin
           DelTree(ExpandConstant('{userappdata}\{#MyAppName}'), True, True, True);
         end;
       end;
+  end;
+end;
+
+function InitializeSetup(): Boolean;
+var
+  UninstallKey: String;
+  UninstallString: String;
+  ResultCode: Integer;
+begin
+  Result := True;
+  
+  // Comprobar si existe una versión anterior
+  UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#SetupSetting("AppId")}_is1';
+  if RegQueryStringValue(HKLM, UninstallKey, 'UninstallString', UninstallString) then
+  begin
+    // Desinstalar la versión anterior
+    if MsgBox('Se detectó una versión anterior de {#MyAppName}. ¿Desea desinstalarla antes de continuar?', mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      Exec(RemoveQuotes(UninstallString), '/SILENT', '', SW_SHOW, ewWaitUntilTerminated, ResultCode);
+    end;
   end;
 end;
