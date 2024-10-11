@@ -17,8 +17,9 @@ import win32api
 from functools import lru_cache
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
+import wgpu
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 def get_windows_file_version(filename):
     info = win32api.GetFileVersionInfo(filename, "\\")
@@ -119,18 +120,140 @@ def check_for_update(version: str, root: tk.Tk) -> bool:
         return False
     return False
 
+class VulkanImageProcessor:
+    def __init__(self):
+        self.device = wgpu.auto_device()
+        self.queue = self.device.queue
+        self.shader = self.device.create_shader_module(code='''
+            @compute @workgroup_size(16, 16)
+            fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+                let idx = global_id.x + global_id.y * params.width;
+                var color = textureLoad(img_in, vec2<i32>(global_id.xy), 0);
+                
+                // Apply brightness and contrast
+                color = color * params.contrast + params.brightness - 1.0;
+                
+                // Apply saturation
+                let gray = dot(color.rgb, vec3<f32>(0.299, 0.587, 0.114));
+                color = mix(vec4<f32>(gray, gray, gray, color.a), color, params.saturation);
+                
+                // Apply grayscale if needed
+                if (params.is_grayscale == 1) {
+                    color = vec4<f32>(gray, gray, gray, color.a);
+                }
+                
+                textureStore(img_out, vec2<i32>(global_id.xy), color);
+            }
+        ''')
+
+    def process_image(self, img: np.ndarray, brightness: float, contrast: float, 
+                      saturation: float, is_grayscale: bool) -> np.ndarray:
+        height, width = img.shape[:2]
+        
+        # Create input texture
+        texture_in = self.device.create_texture(
+            size=(width, height, 1),
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=wgpu.TextureUsage.STORAGE | wgpu.TextureUsage.COPY_DST,
+        )
+        self.queue.write_texture(
+            {"texture": texture_in},
+            img.astype(np.float32) / 255.0,
+            {"bytes_per_row": width * 4},
+            {"width": width, "height": height},
+        )
+        
+        # Create output texture
+        texture_out = self.device.create_texture(
+            size=(width, height, 1),
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=wgpu.TextureUsage.STORAGE | wgpu.TextureUsage.COPY_SRC,
+        )
+        
+        # Create pipeline
+        pipeline = self.device.create_compute_pipeline(
+            layout=None,
+            compute={
+                "module": self.shader,
+                "entry_point": "main",
+            },
+        )
+        
+        # Create bind group
+        bind_group = self.device.create_bind_group(
+            layout=pipeline.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": texture_in.create_view()},
+                {"binding": 1, "resource": texture_out.create_view()},
+                {"binding": 2, "resource": self.device.create_buffer(
+                    size=32,
+                    usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+                    mapped_at_creation=True,
+                )},
+            ],
+        )
+        
+        # Write parameters to uniform buffer
+        params = np.array([width, height, brightness, contrast, saturation, int(is_grayscale)], dtype=np.float32)
+        self.queue.write_buffer(bind_group.entries[2].resource, 0, params.tobytes())
+        
+        # Run compute shader
+        command_encoder = self.device.create_command_encoder()
+        compute_pass = command_encoder.begin_compute_pass()
+        compute_pass.set_pipeline(pipeline)
+        compute_pass.set_bind_group(0, bind_group)
+        compute_pass.dispatch(width // 16 + 1, height // 16 + 1)
+        compute_pass.end()
+        self.queue.submit([command_encoder.finish()])
+        
+        # Read output texture
+        output_buffer = self.device.create_buffer(
+            size=width * height * 4,
+            usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
+        )
+        command_encoder = self.device.create_command_encoder()
+        command_encoder.copy_texture_to_buffer(
+            {"texture": texture_out},
+            {"buffer": output_buffer, "bytes_per_row": width * 4},
+            {"width": width, "height": height},
+        )
+        self.queue.submit([command_encoder.finish()])
+        
+        output_buffer.map()
+        result = np.frombuffer(output_buffer.read(), dtype=np.uint8).reshape(height, width, 4)
+        output_buffer.unmap()
+        
+        return result
+
 class ImageProcessor:
     def __init__(self):
-        self.executor = ThreadPoolExecutor(max_workers=multiprocessing.cpu_count())
+        try:
+            self.vulkan_processor = VulkanImageProcessor()
+            self.use_vulkan = True
+            print("Usando Vulkan para el procesamiento de imágenes")
+        except Exception as e:
+            print(f"No se pudo inicializar Vulkan: {e}")
+            print("Usando procesamiento de CPU")
+            self.use_vulkan = False
+            self.executor = ThreadPoolExecutor(max_workers=multiprocessing.cpu_count())
 
     @lru_cache(maxsize=32)
     def process_image(self, img_bytes: bytes, brightness: float, contrast: float, 
                       saturation: float, angle: int, is_grayscale: bool) -> np.ndarray:
         img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
-        return self._process_image_cpu(img, brightness, contrast, saturation, angle, is_grayscale)
+        
+        if self.use_vulkan:
+            img = self.vulkan_processor.process_image(img, brightness, contrast, saturation, is_grayscale)
+        else:
+            img = self._process_image_cpu(img, brightness, contrast, saturation, is_grayscale)
+        
+        if angle != 0:
+            img = self._rotate_image(img, angle)
+        
+        return img
 
     def _process_image_cpu(self, img: np.ndarray, brightness: float, contrast: float, 
-                           saturation: float, angle: int, is_grayscale: bool) -> np.ndarray:
+                           saturation: float, is_grayscale: bool) -> np.ndarray:
         def process_chunk(chunk):
             chunk = chunk.astype(np.float32) / 255.0
             chunk = chunk * contrast + (brightness - 1)
@@ -147,12 +270,7 @@ class ImageProcessor:
 
         chunks = np.array_split(img, multiprocessing.cpu_count())
         processed_chunks = list(self.executor.map(process_chunk, chunks))
-        img = np.vstack(processed_chunks)
-
-        if angle != 0:
-            img = self._rotate_image(img, angle)
-
-        return img
+        return np.vstack(processed_chunks)
 
     def _rotate_image(self, img: np.ndarray, angle: int) -> np.ndarray:
         h, w = img.shape[:2]
@@ -278,6 +396,10 @@ class PhotoW:
         self.grayscale_var = tk.BooleanVar()
         ttk.Checkbutton(control_frame, text="Escala de Grises", variable=self.grayscale_var, 
                         command=self.update_grayscale).pack(fill=X, pady=5)
+
+        # Add a label to show if Vulkan is being used
+        self.vulkan_label = ttk.Label(control_frame, text=f"Usando {'Vulkan' if self.image_processor.use_vulkan else 'CPU'}")
+        self.vulkan_label.pack(fill=X, pady=5)
 
         self.master.bind("<Configure>", self.on_window_resize)
 
