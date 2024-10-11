@@ -77,15 +77,15 @@ class UpdateSystem:
             
             filename = self._get_filename_from_response(response, download_url)
             
-            with tempfile.TemporaryDirectory() as temp_dir:
-                update_file = os.path.join(temp_dir, filename)
-                
-                with open(update_file, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                
-                return update_file
+            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+            update_file = os.path.join(downloads_dir, filename)
+            
+            with open(update_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            return update_file
         except requests.RequestException as e:
             print(f"Error al descargar la actualización: {e}")
             return None
@@ -98,97 +98,66 @@ class UpdateSystem:
                 return filename[0].strip('"')
         return os.path.basename(url)
 
-    def install_update(self, update_file: str) -> None:
-        if sys.platform.startswith('win'):
-            try:
-                ctypes.windll.shell32.ShellExecuteW(None, "runas", update_file, None, None, 1)
-                self.exit_application()
-            except Exception as e:
-                print(f"Error al iniciar la actualización: {e}")
-                messagebox.showerror("Error", "No se pudo iniciar la actualización. Por favor, inténtelo manualmente.")
-
-    def exit_application(self):
-        sys.exit()
+def check_for_update(version: str, root: tk.Tk) -> bool:
+    updater = UpdateSystem(version)
+    new_version, download_url = updater.check_for_updates()
+    
+    if new_version and download_url:
+        if messagebox.askyesno("Actualización Disponible", 
+                               f"Hay una nueva versión disponible: {new_version}. ¿Desea descargarla?"):
+            update_file = updater.download_update(download_url)
+            if update_file:
+                if messagebox.askyesno("Actualización Descargada", 
+                                       f"La actualización ha sido descargada a:\n{update_file}\n\n¿Desea ejecutar el instalador ahora?"):
+                    root.quit()
+                    os.startfile(update_file)
+                    return True
+                else:
+                    messagebox.showinfo("Información", f"Puede instalar la actualización más tarde ejecutando:\n{update_file}")
+            else:
+                messagebox.showerror("Error", "No se pudo descargar la actualización.")
+        return False
+    return False
 
 class ImageProcessor:
     def __init__(self):
-        self.use_gpu = self._check_gpu_support()
         self.executor = ThreadPoolExecutor(max_workers=multiprocessing.cpu_count())
-
-    def _check_gpu_support(self) -> bool:
-        try:
-            return cv2.cuda.getCudaEnabledDeviceCount() > 0
-        except:
-            return False
 
     @lru_cache(maxsize=32)
     def process_image(self, img_bytes: bytes, brightness: float, contrast: float, 
                       saturation: float, angle: int, is_grayscale: bool) -> np.ndarray:
-        img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-        
-        if self.use_gpu:
-            return self._process_image_gpu(img, brightness, contrast, saturation, angle, is_grayscale)
-        else:
-            return self._process_image_cpu(img, brightness, contrast, saturation, angle, is_grayscale)
-
-    def _process_image_gpu(self, img: np.ndarray, brightness: float, contrast: float, 
-                           saturation: float, angle: int, is_grayscale: bool) -> np.ndarray:
-        gpu_img = cv2.cuda_GpuMat()
-        gpu_img.upload(img)
-
-        # Aplicar brillo y contraste
-        gpu_img = cv2.cuda.multiply(gpu_img, contrast)
-        gpu_img = cv2.cuda.add(gpu_img, brightness - 1)
-
-        # Aplicar saturación
-        if saturation != 1:
-            gpu_hsv = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2HSV)
-            h, s, v = cv2.cuda.split(gpu_hsv)
-            s = cv2.cuda.multiply(s, saturation)
-            gpu_hsv = cv2.cuda.merge((h, s, v))
-            gpu_img = cv2.cuda.cvtColor(gpu_hsv, cv2.COLOR_HSV2BGR)
-
-        # Aplicar rotación
-        if angle != 0:
-            h, w = gpu_img.size()
-            M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
-            gpu_img = cv2.cuda.warpAffine(gpu_img, M, (w, h))
-
-        # Aplicar escala de grises
-        if is_grayscale:
-            gpu_img = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2GRAY)
-            gpu_img = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_GRAY2BGR)
-
-        return gpu_img.download()
+        img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
+        return self._process_image_cpu(img, brightness, contrast, saturation, angle, is_grayscale)
 
     def _process_image_cpu(self, img: np.ndarray, brightness: float, contrast: float, 
                            saturation: float, angle: int, is_grayscale: bool) -> np.ndarray:
         def process_chunk(chunk):
             chunk = chunk.astype(np.float32) / 255.0
-            chunk = cv2.multiply(chunk, contrast)
-            chunk = cv2.add(chunk, brightness - 1)
+            chunk = chunk * contrast + (brightness - 1)
             
             if saturation != 1:
-                hsv = cv2.cvtColor(chunk, cv2.COLOR_BGR2HSV)
-                hsv[:,:,1] *= saturation
-                chunk = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+                gray = np.dot(chunk[..., :3], [0.299, 0.587, 0.114])
+                chunk[..., :3] = chunk[..., :3] * saturation + gray[:, :, np.newaxis] * (1 - saturation)
             
-            return (np.clip(chunk, 0, 1) * 255).astype(np.uint8)
+            if is_grayscale:
+                gray = np.dot(chunk[..., :3], [0.299, 0.587, 0.114])
+                chunk[..., :3] = gray[:, :, np.newaxis]
+            
+            return np.clip(chunk * 255, 0, 255).astype(np.uint8)
 
-        # Dividir la imagen en chunks para procesamiento paralelo
         chunks = np.array_split(img, multiprocessing.cpu_count())
         processed_chunks = list(self.executor.map(process_chunk, chunks))
         img = np.vstack(processed_chunks)
 
         if angle != 0:
-            h, w = img.shape[:2]
-            M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
-            img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR)
-
-        if is_grayscale:
-            img = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+            img = self._rotate_image(img, angle)
 
         return img
+
+    def _rotate_image(self, img: np.ndarray, angle: int) -> np.ndarray:
+        h, w = img.shape[:2]
+        M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
+        return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR)
 
     def crop_image(self, img: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
         return img[y1:y2, x1:x2]
@@ -243,7 +212,8 @@ class PhotoW:
         
         check_current_version()
         
-        if self._check_for_update():
+        if check_for_update(VERSION, self.master):
+            self.master.quit()
             return
 
         self._set_icon()
@@ -264,21 +234,6 @@ class PhotoW:
 
         self._create_widgets()
         self.crop_tool = CropTool(self.canvas, self.apply_crop)
-
-    def _check_for_update(self) -> bool:
-        updater = UpdateSystem(VERSION)
-        new_version, download_url = updater.check_for_updates()
-        
-        if new_version and download_url:
-            if messagebox.askyesno("Actualización disponible", 
-                                   f"Hay una nueva versión disponible: {new_version}. ¿Desea actualizar?"):
-                update_file = updater.download_update(download_url)
-                if update_file:
-                    updater.install_update(update_file)
-                else:
-                    messagebox.showerror("Error", "No se pudo descargar la actualización.")
-            return True
-        return False
 
     def _set_icon(self) -> None:
         if getattr(sys, 'frozen', False):
