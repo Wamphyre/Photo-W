@@ -6,24 +6,12 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
 
-# Recoger todos los submódulos de ttkbootstrap
-ttkbootstrap_submodules = collect_submodules('ttkbootstrap')
-
 a = Analysis(
     ['photo_w.py'],
     pathex=[],
     binaries=[],
-    datas=[
-        ('icon.ico', '.'),
-        *collect_data_files('ttkbootstrap', include_py_files=True)
-    ],
-    hiddenimports=[
-        'ttkbootstrap',
-        *ttkbootstrap_submodules,
-        'PIL._tkinter_finder',
-        'win32api',
-        'win32com.client',
-    ],
+    datas=[('icon.ico', '.')],
+    hiddenimports=['PIL._tkinter_finder', 'ttkbootstrap'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -34,12 +22,8 @@ a = Analysis(
     noarchive=False,
 )
 
-# Excluir archivos innecesarios de opencv
-a.binaries = [x for x in a.binaries if not x[0].startswith("opencv_videoio")]
-
-# Asegurarse de incluir los DLLs necesarios para win32api
-a.binaries += [('win32api.pyd', 'C:\\Windows\\System32\\win32api.pyd', 'BINARY')]
-a.binaries += [('win32com.shell.shell.pyd', 'C:\\Windows\\System32\\win32com.shell.shell.pyd', 'BINARY')]
+# Collect ttkbootstrap data files
+a.datas += collect_data_files('ttkbootstrap')
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
@@ -71,5 +55,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='Photo-W'
+    name='Photo-W',
 )

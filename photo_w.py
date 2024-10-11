@@ -7,8 +7,6 @@ import cv2
 import numpy as np
 import os
 import ctypes
-import threading
-import time
 import sys
 import requests
 import subprocess
@@ -16,8 +14,11 @@ import tempfile
 import re
 from typing import Optional, Tuple
 import win32api
+from functools import lru_cache
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 def get_windows_file_version(filename):
     info = win32api.GetFileVersionInfo(filename, "\\")
@@ -112,6 +113,7 @@ class UpdateSystem:
 class ImageProcessor:
     def __init__(self):
         self.use_gpu = self._check_gpu_support()
+        self.executor = ThreadPoolExecutor(max_workers=multiprocessing.cpu_count())
 
     def _check_gpu_support(self) -> bool:
         try:
@@ -119,8 +121,11 @@ class ImageProcessor:
         except:
             return False
 
-    def process_image(self, img: np.ndarray, brightness: float, contrast: float, 
+    @lru_cache(maxsize=32)
+    def process_image(self, img_bytes: bytes, brightness: float, contrast: float, 
                       saturation: float, angle: int, is_grayscale: bool) -> np.ndarray:
+        img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        
         if self.use_gpu:
             return self._process_image_gpu(img, brightness, contrast, saturation, angle, is_grayscale)
         else:
@@ -131,35 +136,49 @@ class ImageProcessor:
         gpu_img = cv2.cuda_GpuMat()
         gpu_img.upload(img)
 
+        # Aplicar brillo y contraste
         gpu_img = cv2.cuda.multiply(gpu_img, contrast)
-        gpu_img = cv2.cuda.add(gpu_img, (brightness-1)*100)
+        gpu_img = cv2.cuda.add(gpu_img, brightness - 1)
 
-        gpu_hsv = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_RGB2HSV)
-        h, s, v = cv2.cuda.split(gpu_hsv)
-        s = cv2.cuda.multiply(s, saturation)
-        gpu_hsv = cv2.cuda.merge([h, s, v])
-        gpu_img = cv2.cuda.cvtColor(gpu_hsv, cv2.COLOR_HSV2RGB)
+        # Aplicar saturación
+        if saturation != 1:
+            gpu_hsv = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2HSV)
+            h, s, v = cv2.cuda.split(gpu_hsv)
+            s = cv2.cuda.multiply(s, saturation)
+            gpu_hsv = cv2.cuda.merge((h, s, v))
+            gpu_img = cv2.cuda.cvtColor(gpu_hsv, cv2.COLOR_HSV2BGR)
 
+        # Aplicar rotación
         if angle != 0:
             h, w = gpu_img.size()
             M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
             gpu_img = cv2.cuda.warpAffine(gpu_img, M, (w, h))
 
+        # Aplicar escala de grises
         if is_grayscale:
-            gpu_img = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_RGB2GRAY)
-            gpu_img = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_GRAY2RGB)
+            gpu_img = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2GRAY)
+            gpu_img = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_GRAY2BGR)
 
         return gpu_img.download()
 
     def _process_image_cpu(self, img: np.ndarray, brightness: float, contrast: float, 
                            saturation: float, angle: int, is_grayscale: bool) -> np.ndarray:
-        img = cv2.convertScaleAbs(img, alpha=contrast, beta=(brightness-1)*100)
+        def process_chunk(chunk):
+            chunk = chunk.astype(np.float32) / 255.0
+            chunk = cv2.multiply(chunk, contrast)
+            chunk = cv2.add(chunk, brightness - 1)
+            
+            if saturation != 1:
+                hsv = cv2.cvtColor(chunk, cv2.COLOR_BGR2HSV)
+                hsv[:,:,1] *= saturation
+                chunk = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+            
+            return (np.clip(chunk, 0, 1) * 255).astype(np.uint8)
 
-        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-        h, s, v = cv2.split(hsv)
-        s = cv2.multiply(s, saturation)
-        hsv = cv2.merge([h, s, v])
-        img = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+        # Dividir la imagen en chunks para procesamiento paralelo
+        chunks = np.array_split(img, multiprocessing.cpu_count())
+        processed_chunks = list(self.executor.map(process_chunk, chunks))
+        img = np.vstack(processed_chunks)
 
         if angle != 0:
             h, w = img.shape[:2]
@@ -167,10 +186,54 @@ class ImageProcessor:
             img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR)
 
         if is_grayscale:
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            img = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
 
         return img
+
+    def crop_image(self, img: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
+        return img[y1:y2, x1:x2]
+
+class HistoryManager:
+    def __init__(self):
+        self.previous_state = None
+
+    def add_state(self, state):
+        self.previous_state = state
+
+    def undo(self):
+        return self.previous_state
+
+class CropTool:
+    def __init__(self, canvas, on_crop):
+        self.canvas = canvas
+        self.on_crop = on_crop
+        self.start_x = self.start_y = 0
+        self.end_x = self.end_y = 0
+        self.rect_id = None
+
+    def start(self):
+        self.canvas.bind("<ButtonPress-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+
+    def on_press(self, event):
+        self.start_x = self.canvas.canvasx(event.x)
+        self.start_y = self.canvas.canvasy(event.y)
+
+    def on_drag(self, event):
+        if self.rect_id:
+            self.canvas.delete(self.rect_id)
+        self.end_x = self.canvas.canvasx(event.x)
+        self.end_y = self.canvas.canvasy(event.y)
+        self.rect_id = self.canvas.create_rectangle(self.start_x, self.start_y, 
+                                                    self.end_x, self.end_y, 
+                                                    outline='red')
+
+    def on_release(self, event):
+        self.end_x = self.canvas.canvasx(event.x)
+        self.end_y = self.canvas.canvasy(event.y)
+        self.on_crop(self.start_x, self.start_y, self.end_x, self.end_y)
+        self.canvas.delete(self.rect_id)
 
 class PhotoW:
     def __init__(self, master: ttk.Window):
@@ -197,9 +260,10 @@ class PhotoW:
         self.is_grayscale = False
 
         self.image_processor = ImageProcessor()
+        self.history_manager = HistoryManager()
 
         self._create_widgets()
-        self._setup_threading()
+        self.crop_tool = CropTool(self.canvas, self.apply_crop)
 
     def _check_for_update(self) -> bool:
         updater = UpdateSystem(VERSION)
@@ -240,12 +304,15 @@ class PhotoW:
 
         ttk.Button(control_frame, text="Abrir Imagen", command=self.open_image).pack(fill=X, pady=5)
         ttk.Button(control_frame, text="Guardar Imagen", command=self.save_image).pack(fill=X, pady=5)
+        ttk.Button(control_frame, text="Recortar", command=self.start_crop).pack(fill=X, pady=5)
+        ttk.Button(control_frame, text="Deshacer", command=self.undo).pack(fill=X, pady=5)
 
         ttk.Separator(control_frame, orient=HORIZONTAL).pack(fill=X, pady=10)
 
-        self._create_slider(control_frame, "Brillo", 0, 2, 1, 0.01, self.update_brightness)
-        self._create_slider(control_frame, "Contraste", 0, 2, 1, 0.01, self.update_contrast)
-        self._create_slider(control_frame, "Saturación", 0, 2, 1, 0.01, self.update_saturation)
+        self.sliders = []
+        self.sliders.append(self._create_slider(control_frame, "Brillo", 0, 2, 1, 0.01, self.update_brightness))
+        self.sliders.append(self._create_slider(control_frame, "Contraste", 0, 2, 1, 0.01, self.update_contrast))
+        self.sliders.append(self._create_slider(control_frame, "Saturación", 0, 2, 1, 0.01, self.update_saturation))
 
         ttk.Separator(control_frame, orient=HORIZONTAL).pack(fill=X, pady=10)
 
@@ -260,22 +327,13 @@ class PhotoW:
         self.master.bind("<Configure>", self.on_window_resize)
 
     def _create_slider(self, parent: ttk.Frame, label: str, from_: float, to: float, 
-                       initial: float, resolution: float, command: callable) -> None:
+                       initial: float, resolution: float, command: callable) -> ttk.Scale:
         frame = ttk.Frame(parent)
         frame.pack(fill=X, pady=5)
         ttk.Label(frame, text=label).pack(side=TOP, fill=X)
         slider = ttk.Scale(frame, from_=from_, to=to, value=initial, command=command, orient=HORIZONTAL)
         slider.pack(side=BOTTOM, fill=X)
-
-    def _setup_threading(self) -> None:
-        self.update_thread = None
-        self.update_lock = threading.Lock()
-        self.update_event = threading.Event()
-        self.processing = False
-        self.last_update_time = 0
-        self.update_interval = 0.05
-        self.full_quality_thread = None
-        self.full_quality_event = threading.Event()
+        return slider
 
     def open_image(self, file_path: Optional[str] = None) -> None:
         if not file_path:
@@ -286,7 +344,9 @@ class PhotoW:
                 self.cv_image = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2RGB)
                 self.original_cv_image = self.cv_image.copy()
                 self._reset_image_parameters()
-                self.update_image(force=True)
+                self._reset_sliders()
+                self.update_image()
+                self.history_manager.add_state(self.get_current_state())
             except Exception as e:
                 messagebox.showerror("Error", f"No se pudo abrir la imagen: {str(e)}")
 
@@ -298,55 +358,21 @@ class PhotoW:
         self.saturation = 1
         self.is_grayscale = False
 
-    def update_image(self, force: bool = False, preview: bool = False) -> None:
+    def _reset_sliders(self) -> None:
+        for slider in self.sliders:
+            slider.set(1)  # Asumiendo que 1 es el valor predeterminado
+        self.grayscale_var.set(False)
+
+    def update_image(self) -> None:
         if self.cv_image is None:
             return
 
-        current_time = time.time()
-        if force or (current_time - self.last_update_time) >= self.update_interval:
-            self.last_update_time = current_time
-            if self.update_thread is None or not self.update_thread.is_alive():
-                self.update_thread = threading.Thread(target=self._process_and_display, args=(preview,))
-                self.update_thread.start()
-            else:
-                self.update_event.set()
-
-        if self.full_quality_thread is None or not self.full_quality_thread.is_alive():
-            self.full_quality_thread = threading.Thread(target=self._process_full_quality)
-            self.full_quality_thread.start()
-
-    def _process_and_display(self, preview: bool) -> None:
-        while True:
-            with self.update_lock:
-                if self.processing:
-                    continue
-                self.processing = True
-
-            processed = self.image_processor.process_image(
-                self.original_cv_image, self.brightness, self.contrast, 
-                self.saturation, self.angle, self.is_grayscale
-            )
-            if processed is not None:
-                self._resize_and_display(processed)
-
-            with self.update_lock:
-                self.processing = False
-
-            if not preview:
-                break
-
-            if not self.update_event.wait(timeout=0.01):
-                break
-            self.update_event.clear()
-
-    def _process_full_quality(self) -> None:
-        time.sleep(0.5)
+        img_bytes = cv2.imencode('.png', self.cv_image)[1].tobytes()
         processed = self.image_processor.process_image(
-            self.original_cv_image, self.brightness, self.contrast, 
+            img_bytes, self.brightness, self.contrast, 
             self.saturation, self.angle, self.is_grayscale
         )
-        if processed is not None:
-            self.master.after_idle(lambda: self._resize_and_display(processed))
+        self._resize_and_display(processed)
 
     def _resize_and_display(self, img: np.ndarray) -> None:
         canvas_width = self.canvas.winfo_width()
@@ -358,48 +384,46 @@ class PhotoW:
         new_width = int(img_width * scale)
         new_height = int(img_height * scale)
         
-        resized = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
-        self.photo = ImageTk.PhotoImage(image=Image.fromarray(resized))
-        
-        self.master.after_idle(self._update_canvas)
-
-    def _update_canvas(self) -> None:
-        if self.photo:
+        if new_width > 0 and new_height > 0:
+            pil_img = Image.fromarray(img)
+            resized = pil_img.resize((new_width, new_height), Image.LANCZOS)
+            self.photo = ImageTk.PhotoImage(image=resized)
             self.canvas.delete("all")
-            self.canvas.create_image(self.canvas.winfo_width()/2, self.canvas.winfo_height()/2, anchor=CENTER, image=self.photo)
+            self.canvas.create_image(canvas_width/2, canvas_height/2, anchor=CENTER, image=self.photo)
 
     def update_brightness(self, value: str) -> None:
+        self.history_manager.add_state(self.get_current_state())
         self.brightness = float(value)
-        self._update_image_and_notify()
+        self.update_image()
 
     def update_contrast(self, value: str) -> None:
+        self.history_manager.add_state(self.get_current_state())
         self.contrast = float(value)
-        self._update_image_and_notify()
+        self.update_image()
 
     def update_saturation(self, value: str) -> None:
+        self.history_manager.add_state(self.get_current_state())
         self.saturation = float(value)
-        self._update_image_and_notify()
+        self.update_image()
 
     def update_grayscale(self) -> None:
+        self.history_manager.add_state(self.get_current_state())
         self.is_grayscale = self.grayscale_var.get()
-        self._update_image_and_notify()
-
-    def _update_image_and_notify(self) -> None:
-        self.update_image(preview=True)
-        self.full_quality_event.set()
+        self.update_image()
 
     def rotate_image(self) -> None:
+        self.history_manager.add_state(self.get_current_state())
         self.angle += 90
         self.angle %= 360
-        self.update_image(force=True)
+        self.update_image()
 
     def zoom_in(self) -> None:
         self.zoom *= 1.2
-        self.update_image(force=True)
+        self.update_image()
 
     def zoom_out(self) -> None:
         self.zoom /= 1.2
-        self.update_image(force=True)
+        self.update_image()
 
     def save_image(self) -> None:
         if self.cv_image is not None:
@@ -412,8 +436,9 @@ class PhotoW:
             file_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=file_types)
             if file_path:
                 try:
+                    img_bytes = cv2.imencode('.png', self.cv_image)[1].tobytes()
                     processed = self.image_processor.process_image(
-                        self.original_cv_image, self.brightness, self.contrast, 
+                        img_bytes, self.brightness, self.contrast, 
                         self.saturation, self.angle, self.is_grayscale
                     )
                     cv2.imwrite(file_path, cv2.cvtColor(processed, cv2.COLOR_RGB2BGR))
@@ -425,17 +450,68 @@ class PhotoW:
 
     def on_window_resize(self, event: tk.Event) -> None:
         if self.cv_image is not None:
-            self.update_image(force=True)
+            self.update_image()
+
+    def start_crop(self) -> None:
+        self.crop_tool.start()
+
+    def apply_crop(self, start_x: float, start_y: float, end_x: float, end_y: float) -> None:
+        if self.cv_image is not None:
+            img_height, img_width = self.cv_image.shape[:2]
+            canvas_width = self.canvas.winfo_width()
+            canvas_height = self.canvas.winfo_height()
+            
+            scale = min(canvas_width/img_width, canvas_height/img_height)
+            
+            x1 = max(0, int((start_x - (canvas_width - img_width*scale)/2) / scale))
+            y1 = max(0, int((start_y - (canvas_height - img_height*scale)/2) / scale))
+            x2 = min(img_width, int((end_x - (canvas_width - img_width*scale)/2) / scale))
+            y2 = min(img_height, int((end_y - (canvas_height - img_height*scale)/2) / scale))
+            
+            self.history_manager.add_state(self.get_current_state())
+            self.cv_image = self.image_processor.crop_image(self.cv_image, x1, y1, x2, y2)
+            self.update_image()
+
+    def get_current_state(self) -> dict:
+        return {
+            'image': self.cv_image.copy() if self.cv_image is not None else None,
+            'brightness': self.brightness,
+            'contrast': self.contrast,
+            'saturation': self.saturation,
+            'angle': self.angle,
+            'is_grayscale': self.is_grayscale
+        }
+
+    def set_state(self, state: dict) -> None:
+        if state is None:
+            return
+        self.cv_image = state['image'].copy() if state['image'] is not None else None
+        self.brightness = state['brightness']
+        self.contrast = state['contrast']
+        self.saturation = state['saturation']
+        self.angle = state['angle']
+        self.is_grayscale = state['is_grayscale']
+        self._update_sliders()
+        self.update_image()
+
+    def _update_sliders(self) -> None:
+        self.sliders[0].set(self.brightness)
+        self.sliders[1].set(self.contrast)
+        self.sliders[2].set(self.saturation)
+        self.grayscale_var.set(self.is_grayscale)
+
+    def undo(self) -> None:
+        state = self.history_manager.undo()
+        if state:
+            self.set_state(state)
 
 def main():
-    # Evitar que se abra una consola en Windows
     if sys.platform.startswith('win'):
         ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
     root = ttk.Window("Photo-W")
     app = PhotoW(root)
     
-    # Verificar si se pasó una imagen como argumento
     if len(sys.argv) > 1:
         app.open_image(sys.argv[1])
     
