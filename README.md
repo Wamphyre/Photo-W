@@ -54,4 +54,5 @@ La licencia BSD de 3 cláusulas es una licencia de software libre permisiva que 
 
 ## Autor
 
-Hecho por Wamphyre. Si te gusta puedes comprarme un café en https://ko-fi.com/wamphyre94078
+Desarrollado con ❤️ por [Wamphyre](https://github.com/Wamphyre)
+Si te gusta puedes comprarme un café en https://ko-fi.com/wamphyre94078
