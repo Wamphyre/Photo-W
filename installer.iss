@@ -1,5 +1,5 @@
 #define MyAppName "Photo-W"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.1"
 #define MyAppPublisher "Wamphyre"
 #define MyAppExeName "Photo-W.exe"
 
@@ -9,14 +9,18 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
+DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputBaseFilename=Photo-W-Setup
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
+UninstallDisplayIcon={app}\{#MyAppExeName}
+UninstallDisplayName={#MyAppName}
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -40,3 +44,23 @@ Root: HKCR; Subkey: "Photo-W.Image\shell\open\command"; ValueType: string; Value
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}"
+
+[Code]
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  mRes : integer;
+begin
+  case CurUninstallStep of
+    usUninstall:
+      begin
+        mRes := MsgBox('¿Desea eliminar todos los archivos de configuración y datos de usuario?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2)
+        if mRes = IDYES then
+        begin
+          DelTree(ExpandConstant('{userappdata}\{#MyAppName}'), True, True, True);
+        end;
+      end;
+  end;
+end;

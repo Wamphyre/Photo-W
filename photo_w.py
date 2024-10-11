@@ -10,15 +10,103 @@ import ctypes
 import threading
 import time
 import sys
+import requests
+import subprocess
+import tempfile
+import re
 
 # Evitar que se abra una consola en Windows
 ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
+VERSION = "1.1"
+
+class UpdateSystem:
+    def __init__(self, current_version):
+        self.current_version = current_version
+        self.repo_url = "Wamphyre/Photo-W"
+        self.api_url = f"https://api.github.com/repos/{self.repo_url}/releases/latest"
+
+    def check_for_updates(self):
+        try:
+            response = requests.get(self.api_url)
+            response.raise_for_status()
+            latest_release = response.json()
+            latest_version = latest_release['tag_name']
+            
+            if self.is_newer_version(latest_version):
+                return latest_version, self.get_windows_exe_url(latest_release)
+            return None, None
+        except requests.RequestException:
+            return None, None
+
+    def is_newer_version(self, latest_version):
+        current = [int(x) for x in self.current_version.split('.')]
+        latest = [int(x) for x in latest_version.split('.')]
+        return latest > current
+
+    def get_windows_exe_url(self, release):
+        for asset in release['assets']:
+            if asset['name'].endswith('.exe'):
+                return asset['browser_download_url']
+        return None
+
+    def download_update(self, download_url):
+        try:
+            response = requests.get(download_url, stream=True)
+            response.raise_for_status()
+            
+            filename = self.get_filename_from_response(response, download_url)
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                update_file = os.path.join(temp_dir, filename)
+                
+                with open(update_file, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                return update_file
+        except requests.RequestException as e:
+            print(f"Error al descargar la actualización: {e}")
+            return None
+
+    def get_filename_from_response(self, response, url):
+        content_disposition = response.headers.get('Content-Disposition')
+        if content_disposition:
+            filename = re.findall("filename=(.+)", content_disposition)
+            if filename:
+                return filename[0].strip('"')
+        return os.path.basename(url)
+
+    def install_update(self, update_file):
+        if sys.platform.startswith('win'):
+            subprocess.Popen([update_file], shell=True)
+            sys.exit()
+
+def check_for_update(version):
+    updater = UpdateSystem(version)
+    new_version, download_url = updater.check_for_updates()
+    
+    if new_version and download_url:
+        if messagebox.askyesno("Actualización disponible", 
+                               f"Hay una nueva versión disponible: {new_version}. ¿Desea actualizar?"):
+            update_file = updater.download_update(download_url)
+            if update_file:
+                updater.install_update(update_file)
+            else:
+                messagebox.showerror("Error", "No se pudo descargar la actualización.")
+        return True
+    return False
+
 class PhotoW:
     def __init__(self, master):
         self.master = master
-        self.master.title("Photo-W")
+        self.master.title(f"Photo-W v{VERSION}")
         self.master.geometry("1000x600")
+        
+        # Verificar actualizaciones al inicio
+        if check_for_update(VERSION):
+            return  # Si hay una actualización, no continuamos con la inicialización
         
         # Establecer el icono de la aplicación
         if getattr(sys, 'frozen', False):
@@ -48,14 +136,22 @@ class PhotoW:
         self.processing = False
         self.last_update_time = 0
         self.update_interval = 0.05  # 50 ms entre actualizaciones
-        self.preview_scale = 0.25  # Escala para la previsualización rápida
+        self.preview_scale = 1.0  # Cambiamos la escala de previsualización a 1.0
+        self.full_quality_thread = None
+        self.full_quality_event = threading.Event()
 
-        # Intentar habilitar la aceleración por hardware de OpenCV
-        cv2.ocl.setUseOpenCL(True)
-        if cv2.ocl.haveOpenCL():
-            print("OpenCL está disponible. Aceleración por hardware habilitada.")
+        # Verificar soporte GPU
+        self.use_gpu = self.check_gpu_support()
+        if self.use_gpu:
+            print("Aceleración GPU habilitada")
         else:
-            print("OpenCL no está disponible. Usando CPU.")
+            print("Usando CPU para el procesamiento")
+
+    def check_gpu_support(self):
+        try:
+            return cv2.cuda.getCudaEnabledDeviceCount() > 0
+        except:
+            return False
 
     def create_widgets(self):
         self.main_frame = ttk.Frame(self.master)
@@ -126,35 +222,58 @@ class PhotoW:
 
         img = self.original_cv_image.copy()
 
-        if preview:
-            h, w = img.shape[:2]
-            img = cv2.resize(img, (int(w*self.preview_scale), int(h*self.preview_scale)), interpolation=cv2.INTER_LINEAR)
+        if self.use_gpu:
+            # Convertir la imagen a GPU
+            gpu_img = cv2.cuda_GpuMat()
+            gpu_img.upload(img)
 
-        # Convertir a UMat para posible aceleración por hardware
-        img = cv2.UMat(img)
+            # Aplicar brillo y contraste
+            gpu_img = cv2.cuda.multiply(gpu_img, self.contrast)
+            gpu_img = cv2.cuda.add(gpu_img, (self.brightness-1)*100)
 
-        # Aplicar brillo y contraste
-        img = cv2.convertScaleAbs(img, alpha=self.contrast, beta=(self.brightness-1)*100)
+            # Convertir a HSV para aplicar saturación
+            gpu_hsv = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_RGB2HSV)
+            h, s, v = cv2.cuda.split(gpu_hsv)
+            s = cv2.cuda.multiply(s, self.saturation)
+            gpu_hsv = cv2.cuda.merge([h, s, v])
+            gpu_img = cv2.cuda.cvtColor(gpu_hsv, cv2.COLOR_HSV2RGB)
 
-        # Aplicar saturación
-        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-        h, s, v = cv2.split(hsv)
-        s = cv2.multiply(s, self.saturation)
-        hsv = cv2.merge([h, s, v])
-        img = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+            # Aplicar rotación
+            if self.angle != 0:
+                h, w = gpu_img.size()
+                M = cv2.getRotationMatrix2D((w/2, h/2), self.angle, 1)
+                gpu_img = cv2.cuda.warpAffine(gpu_img, M, (w, h))
 
-        # Aplicar rotación
-        if self.angle != 0:
-            h, w = img.get().shape[:2]
-            M = cv2.getRotationMatrix2D((w/2, h/2), self.angle, 1)
-            img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR)
+            # Aplicar escala de grises
+            if self.is_grayscale:
+                gpu_img = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_RGB2GRAY)
+                gpu_img = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_GRAY2RGB)
 
-        # Aplicar escala de grises
-        if self.is_grayscale:
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            # Descargar la imagen procesada de la GPU
+            img = gpu_img.download()
+        else:
+            # Aplicar brillo y contraste
+            img = cv2.convertScaleAbs(img, alpha=self.contrast, beta=(self.brightness-1)*100)
 
-        return img.get()  # Convertir de vuelta a array numpy
+            # Aplicar saturación
+            hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+            h, s, v = cv2.split(hsv)
+            s = cv2.multiply(s, self.saturation)
+            hsv = cv2.merge([h, s, v])
+            img = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+            # Aplicar rotación
+            if self.angle != 0:
+                h, w = img.shape[:2]
+                M = cv2.getRotationMatrix2D((w/2, h/2), self.angle, 1)
+                img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR)
+
+            # Aplicar escala de grises
+            if self.is_grayscale:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+
+        return img
 
     def update_image(self, force=False, preview=False):
         if self.cv_image is None:
@@ -169,6 +288,11 @@ class PhotoW:
             else:
                 self.update_event.set()
 
+        # Iniciamos un hilo para el procesamiento de alta calidad
+        if self.full_quality_thread is None or not self.full_quality_thread.is_alive():
+            self.full_quality_thread = threading.Thread(target=self._process_full_quality)
+            self.full_quality_thread.start()
+
     def _process_and_display(self, preview):
         while True:
             with self.update_lock:
@@ -178,19 +302,7 @@ class PhotoW:
 
             processed = self.process_image(preview)
             if processed is not None:
-                canvas_width = self.canvas.winfo_width()
-                canvas_height = self.canvas.winfo_height()
-                img_height, img_width = processed.shape[:2]
-                
-                scale = min(canvas_width/img_width, canvas_height/img_height) * self.zoom
-                
-                new_width = int(img_width * scale)
-                new_height = int(img_height * scale)
-                
-                resized = cv2.resize(processed, (new_width, new_height), interpolation=cv2.INTER_AREA)
-                self.photo = ImageTk.PhotoImage(image=Image.fromarray(resized))
-                
-                self.master.after_idle(self._update_canvas)
+                self._resize_and_display(processed)
 
             with self.update_lock:
                 self.processing = False
@@ -202,6 +314,27 @@ class PhotoW:
                 break
             self.update_event.clear()
 
+    def _process_full_quality(self):
+        time.sleep(0.5)  # Esperamos un poco para evitar procesamiento innecesario durante ajustes rápidos
+        processed = self.process_image(preview=False)
+        if processed is not None:
+            self.master.after_idle(lambda: self._resize_and_display(processed))
+
+    def _resize_and_display(self, img):
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        img_height, img_width = img.shape[:2]
+        
+        scale = min(canvas_width/img_width, canvas_height/img_height) * self.zoom
+        
+        new_width = int(img_width * scale)
+        new_height = int(img_height * scale)
+        
+        resized = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        self.photo = ImageTk.PhotoImage(image=Image.fromarray(resized))
+        
+        self.master.after_idle(self._update_canvas)
+
     def _update_canvas(self):
         if self.photo:
             self.canvas.delete("all")
@@ -210,18 +343,22 @@ class PhotoW:
     def update_brightness(self, value):
         self.brightness = float(value)
         self.update_image(preview=True)
+        self.full_quality_event.set()
 
     def update_contrast(self, value):
         self.contrast = float(value)
         self.update_image(preview=True)
+        self.full_quality_event.set()
 
     def update_saturation(self, value):
         self.saturation = float(value)
         self.update_image(preview=True)
+        self.full_quality_event.set()
 
     def update_grayscale(self):
         self.is_grayscale = self.grayscale_var.get()
         self.update_image(preview=True)
+        self.full_quality_event.set()
 
     def rotate_image(self):
         self.angle += 90
@@ -259,7 +396,7 @@ class PhotoW:
         if self.cv_image is not None:
             self.update_image(force=True)
 
-if __name__ == "__main__":
+def main():
     root = ttk.Window("Photo-W")
     app = PhotoW(root)
     
@@ -268,3 +405,6 @@ if __name__ == "__main__":
         app.open_image(sys.argv[1])
     
     root.mainloop()
+
+if __name__ == "__main__":
+    main()

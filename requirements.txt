@@ -2,3 +2,4 @@ ttkbootstrap
 Pillow
 opencv-python-headless
 numpy
+requests
