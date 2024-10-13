@@ -4,4 +4,3 @@ opencv-python-headless
 numpy
 requests
 pywin32
-wgpu

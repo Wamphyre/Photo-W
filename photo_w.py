@@ -17,9 +17,13 @@ import win32api
 from functools import lru_cache
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
-import wgpu
+import logging
+import hashlib
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 def get_windows_file_version(filename):
     info = win32api.GetFileVersionInfo(filename, "\\")
@@ -36,10 +40,12 @@ def LOWORD(x):
 def check_current_version():
     try:
         current_version = get_windows_file_version(sys.executable)
-        if current_version != VERSION:
-            print(f"Advertencia: La versión del ejecutable ({current_version}) no coincide con la versión declarada ({VERSION})")
+        current_version_parts = current_version.split('.')[:3]
+        declared_version_parts = VERSION.split('.')
+        if current_version_parts != declared_version_parts:
+            logger.warning(f"La versión del ejecutable ({'.'.join(current_version_parts)}) no coincide con la versión declarada ({VERSION})")
     except Exception as e:
-        print(f"Error al verificar la versión: {e}")
+        logger.error(f"Error al verificar la versión: {e}")
 
 class UpdateSystem:
     def __init__(self, current_version: str):
@@ -49,7 +55,7 @@ class UpdateSystem:
 
     def check_for_updates(self) -> Tuple[Optional[str], Optional[str]]:
         try:
-            response = requests.get(self.api_url)
+            response = requests.get(self.api_url, timeout=10)
             response.raise_for_status()
             latest_release = response.json()
             latest_version = latest_release['tag_name']
@@ -57,7 +63,8 @@ class UpdateSystem:
             if self._is_newer_version(latest_version):
                 return latest_version, self._get_windows_exe_url(latest_release)
             return None, None
-        except requests.RequestException:
+        except requests.RequestException as e:
+            logger.error(f"Error al verificar actualizaciones: {e}")
             return None, None
 
     def _is_newer_version(self, latest_version: str) -> bool:
@@ -73,7 +80,7 @@ class UpdateSystem:
 
     def download_update(self, download_url: str) -> Optional[str]:
         try:
-            response = requests.get(download_url, stream=True)
+            response = requests.get(download_url, stream=True, timeout=30)
             response.raise_for_status()
             
             filename = self._get_filename_from_response(response, download_url)
@@ -88,7 +95,7 @@ class UpdateSystem:
             
             return update_file
         except requests.RequestException as e:
-            print(f"Error al descargar la actualización: {e}")
+            logger.error(f"Error al descargar la actualización: {e}")
             return None
 
     def _get_filename_from_response(self, response: requests.Response, url: str) -> str:
@@ -99,178 +106,55 @@ class UpdateSystem:
                 return filename[0].strip('"')
         return os.path.basename(url)
 
-def check_for_update(version: str, root: tk.Tk) -> bool:
-    updater = UpdateSystem(version)
-    new_version, download_url = updater.check_for_updates()
-    
-    if new_version and download_url:
-        if messagebox.askyesno("Actualización Disponible", 
-                               f"Hay una nueva versión disponible: {new_version}. ¿Desea descargarla?"):
-            update_file = updater.download_update(download_url)
-            if update_file:
-                if messagebox.askyesno("Actualización Descargada", 
-                                       f"La actualización ha sido descargada a:\n{update_file}\n\n¿Desea ejecutar el instalador ahora?"):
-                    root.quit()
-                    os.startfile(update_file)
-                    return True
-                else:
-                    messagebox.showinfo("Información", f"Puede instalar la actualización más tarde ejecutando:\n{update_file}")
-            else:
-                messagebox.showerror("Error", "No se pudo descargar la actualización.")
-        return False
-    return False
-
-class VulkanImageProcessor:
-    def __init__(self):
-        self.device = wgpu.auto_device()
-        self.queue = self.device.queue
-        self.shader = self.device.create_shader_module(code='''
-            @compute @workgroup_size(16, 16)
-            fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-                let idx = global_id.x + global_id.y * params.width;
-                var color = textureLoad(img_in, vec2<i32>(global_id.xy), 0);
-                
-                // Apply brightness and contrast
-                color = color * params.contrast + params.brightness - 1.0;
-                
-                // Apply saturation
-                let gray = dot(color.rgb, vec3<f32>(0.299, 0.587, 0.114));
-                color = mix(vec4<f32>(gray, gray, gray, color.a), color, params.saturation);
-                
-                // Apply grayscale if needed
-                if (params.is_grayscale == 1) {
-                    color = vec4<f32>(gray, gray, gray, color.a);
-                }
-                
-                textureStore(img_out, vec2<i32>(global_id.xy), color);
-            }
-        ''')
-
-    def process_image(self, img: np.ndarray, brightness: float, contrast: float, 
-                      saturation: float, is_grayscale: bool) -> np.ndarray:
-        height, width = img.shape[:2]
-        
-        # Create input texture
-        texture_in = self.device.create_texture(
-            size=(width, height, 1),
-            format=wgpu.TextureFormat.rgba8unorm,
-            usage=wgpu.TextureUsage.STORAGE | wgpu.TextureUsage.COPY_DST,
-        )
-        self.queue.write_texture(
-            {"texture": texture_in},
-            img.astype(np.float32) / 255.0,
-            {"bytes_per_row": width * 4},
-            {"width": width, "height": height},
-        )
-        
-        # Create output texture
-        texture_out = self.device.create_texture(
-            size=(width, height, 1),
-            format=wgpu.TextureFormat.rgba8unorm,
-            usage=wgpu.TextureUsage.STORAGE | wgpu.TextureUsage.COPY_SRC,
-        )
-        
-        # Create pipeline
-        pipeline = self.device.create_compute_pipeline(
-            layout=None,
-            compute={
-                "module": self.shader,
-                "entry_point": "main",
-            },
-        )
-        
-        # Create bind group
-        bind_group = self.device.create_bind_group(
-            layout=pipeline.get_bind_group_layout(0),
-            entries=[
-                {"binding": 0, "resource": texture_in.create_view()},
-                {"binding": 1, "resource": texture_out.create_view()},
-                {"binding": 2, "resource": self.device.create_buffer(
-                    size=32,
-                    usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
-                    mapped_at_creation=True,
-                )},
-            ],
-        )
-        
-        # Write parameters to uniform buffer
-        params = np.array([width, height, brightness, contrast, saturation, int(is_grayscale)], dtype=np.float32)
-        self.queue.write_buffer(bind_group.entries[2].resource, 0, params.tobytes())
-        
-        # Run compute shader
-        command_encoder = self.device.create_command_encoder()
-        compute_pass = command_encoder.begin_compute_pass()
-        compute_pass.set_pipeline(pipeline)
-        compute_pass.set_bind_group(0, bind_group)
-        compute_pass.dispatch(width // 16 + 1, height // 16 + 1)
-        compute_pass.end()
-        self.queue.submit([command_encoder.finish()])
-        
-        # Read output texture
-        output_buffer = self.device.create_buffer(
-            size=width * height * 4,
-            usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
-        )
-        command_encoder = self.device.create_command_encoder()
-        command_encoder.copy_texture_to_buffer(
-            {"texture": texture_out},
-            {"buffer": output_buffer, "bytes_per_row": width * 4},
-            {"width": width, "height": height},
-        )
-        self.queue.submit([command_encoder.finish()])
-        
-        output_buffer.map()
-        result = np.frombuffer(output_buffer.read(), dtype=np.uint8).reshape(height, width, 4)
-        output_buffer.unmap()
-        
-        return result
-
 class ImageProcessor:
     def __init__(self):
-        try:
-            self.vulkan_processor = VulkanImageProcessor()
-            self.use_vulkan = True
-            print("Usando Vulkan para el procesamiento de imágenes")
-        except Exception as e:
-            print(f"No se pudo inicializar Vulkan: {e}")
-            print("Usando procesamiento de CPU")
-            self.use_vulkan = False
-            self.executor = ThreadPoolExecutor(max_workers=multiprocessing.cpu_count())
+        self.executor = ThreadPoolExecutor(max_workers=multiprocessing.cpu_count())
+        self.image_cache = {}
 
-    @lru_cache(maxsize=32)
-    def process_image(self, img_bytes: bytes, brightness: float, contrast: float, 
-                      saturation: float, angle: int, is_grayscale: bool) -> np.ndarray:
-        img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
+    @lru_cache(maxsize=10)
+    def _process_image_cached(self, img_hash, brightness, contrast, saturation, angle, is_grayscale):
+        img = self.image_cache.get(img_hash)
+        if img is None:
+            return None
         
-        if self.use_vulkan:
-            img = self.vulkan_processor.process_image(img, brightness, contrast, saturation, is_grayscale)
-        else:
-            img = self._process_image_cpu(img, brightness, contrast, saturation, is_grayscale)
-        
+        processed = img.copy()
+
         if angle != 0:
-            img = self._rotate_image(img, angle)
-        
-        return img
+            processed = self._rotate_image(processed, angle)
 
-    def _process_image_cpu(self, img: np.ndarray, brightness: float, contrast: float, 
-                           saturation: float, is_grayscale: bool) -> np.ndarray:
-        def process_chunk(chunk):
-            chunk = chunk.astype(np.float32) / 255.0
-            chunk = chunk * contrast + (brightness - 1)
-            
-            if saturation != 1:
-                gray = np.dot(chunk[..., :3], [0.299, 0.587, 0.114])
-                chunk[..., :3] = chunk[..., :3] * saturation + gray[:, :, np.newaxis] * (1 - saturation)
-            
-            if is_grayscale:
-                gray = np.dot(chunk[..., :3], [0.299, 0.587, 0.114])
-                chunk[..., :3] = gray[:, :, np.newaxis]
-            
-            return np.clip(chunk * 255, 0, 255).astype(np.uint8)
+        processed = self._adjust_image(processed, brightness, contrast, saturation, is_grayscale)
 
-        chunks = np.array_split(img, multiprocessing.cpu_count())
-        processed_chunks = list(self.executor.map(process_chunk, chunks))
-        return np.vstack(processed_chunks)
+        return processed
+
+    def process_image(self, img: np.ndarray, brightness: float, contrast: float, 
+                      saturation: float, angle: int, is_grayscale: bool) -> np.ndarray:
+        img_hash = hash(img.tobytes())
+        self.image_cache[img_hash] = img
+        return self._process_image_cached(img_hash, brightness, contrast, saturation, angle, is_grayscale)
+
+    def _adjust_image(self, img: np.ndarray, brightness: float, contrast: float, 
+                      saturation: float, is_grayscale: bool) -> np.ndarray:
+        # Convertir a float32 para cálculos precisos
+        img = img.astype(np.float32) / 255.0
+
+        # Ajustar brillo y contraste
+        img = img * contrast + (brightness - 1)
+
+        # Ajustar saturación
+        if saturation != 1:
+            hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+            hsv[:,:,1] = np.clip(hsv[:,:,1] * saturation, 0, 1)
+            img = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+        # Convertir a escala de grises si es necesario
+        if is_grayscale:
+            img = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY), cv2.COLOR_GRAY2RGB)
+
+        # Asegurar que los valores estén en el rango [0, 1]
+        img = np.clip(img, 0, 1)
+
+        # Convertir de vuelta a uint8
+        return (img * 255).astype(np.uint8)
 
     def _rotate_image(self, img: np.ndarray, angle: int) -> np.ndarray:
         h, w = img.shape[:2]
@@ -282,13 +166,19 @@ class ImageProcessor:
 
 class HistoryManager:
     def __init__(self):
-        self.previous_state = None
+        self.states = []
+        self.current_index = -1
 
     def add_state(self, state):
-        self.previous_state = state
+        self.states = self.states[:self.current_index + 1]
+        self.states.append(state)
+        self.current_index = len(self.states) - 1
 
     def undo(self):
-        return self.previous_state
+        if self.current_index > 0:
+            self.current_index -= 1
+            return self.states[self.current_index]
+        return None
 
 class CropTool:
     def __init__(self, canvas, on_crop):
@@ -397,10 +287,6 @@ class PhotoW:
         ttk.Checkbutton(control_frame, text="Escala de Grises", variable=self.grayscale_var, 
                         command=self.update_grayscale).pack(fill=X, pady=5)
 
-        # Add a label to show if Vulkan is being used
-        self.vulkan_label = ttk.Label(control_frame, text=f"Usando {'Vulkan' if self.image_processor.use_vulkan else 'CPU'}")
-        self.vulkan_label.pack(fill=X, pady=5)
-
         self.master.bind("<Configure>", self.on_window_resize)
 
     def _create_slider(self, parent: ttk.Frame, label: str, from_: float, to: float, 
@@ -418,37 +304,49 @@ class PhotoW:
         if file_path:
             try:
                 self.cv_image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
-                self.cv_image = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2RGB)
+                if self.cv_image is None:
+                    raise ValueError("No se pudo cargar la imagen")
+                
+                if len(self.cv_image.shape) == 2:  # Imagen en escala de grises
+                    self.cv_image = cv2.cvtColor(self.cv_image, cv2.COLOR_GRAY2RGB)
+                elif self.cv_image.shape[2] == 3:  # Imagen BGR
+                    self.cv_image = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2RGB)
+                elif self.cv_image.shape[2] == 4:  # Imagen BGRA
+                    self.cv_image = cv2.cvtColor(self.cv_image, cv2.COLOR_BGRA2RGBA)
+                
                 self.original_cv_image = self.cv_image.copy()
+                logger.debug(f"Imagen cargada: shape={self.cv_image.shape}, dtype={self.cv_image.dtype}")
                 self._reset_image_parameters()
                 self._reset_sliders()
                 self.update_image()
                 self.history_manager.add_state(self.get_current_state())
             except Exception as e:
+                logger.error(f"No se pudo abrir la imagen: {str(e)}")
                 messagebox.showerror("Error", f"No se pudo abrir la imagen: {str(e)}")
 
     def _reset_image_parameters(self) -> None:
-        self.zoom = 1
+        self.zoom = 1.0
         self.angle = 0
-        self.brightness = 1
-        self.contrast = 1
-        self.saturation = 1
+        self.brightness = 1.0
+        self.contrast = 1.0
+        self.saturation = 1.0
         self.is_grayscale = False
 
     def _reset_sliders(self) -> None:
         for slider in self.sliders:
-            slider.set(1)  # Asumiendo que 1 es el valor predeterminado
+            slider.set(1)
         self.grayscale_var.set(False)
 
     def update_image(self) -> None:
         if self.cv_image is None:
             return
 
-        img_bytes = cv2.imencode('.png', self.cv_image)[1].tobytes()
         processed = self.image_processor.process_image(
-            img_bytes, self.brightness, self.contrast, 
+            self.cv_image, self.brightness, self.contrast, 
             self.saturation, self.angle, self.is_grayscale
         )
+        logger.debug(f"Imagen procesada: shape={processed.shape}, dtype={processed.dtype}")
+        
         self._resize_and_display(processed)
 
     def _resize_and_display(self, img: np.ndarray) -> None:
@@ -456,43 +354,56 @@ class PhotoW:
         canvas_height = self.canvas.winfo_height()
         img_height, img_width = img.shape[:2]
         
+        # Calcular la escala para ajustar la imagen al canvas manteniendo la relación de aspecto
         scale = min(canvas_width/img_width, canvas_height/img_height) * self.zoom
         
         new_width = int(img_width * scale)
         new_height = int(img_height * scale)
         
         if new_width > 0 and new_height > 0:
-            pil_img = Image.fromarray(img)
-            resized = pil_img.resize((new_width, new_height), Image.LANCZOS)
-            self.photo = ImageTk.PhotoImage(image=resized)
+            # Redimensionar la imagen
+            resized = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            
+            # Convertir la imagen a formato PIL
+            pil_img = Image.fromarray(resized)
+            
+            self.photo = ImageTk.PhotoImage(image=pil_img)
             self.canvas.delete("all")
-            self.canvas.create_image(canvas_width/2, canvas_height/2, anchor=CENTER, image=self.photo)
+            
+            # Centrar la imagen en el canvas
+            x = max(0, (canvas_width - new_width) // 2)
+            y = max(0, (canvas_height - new_height) // 2)
+            
+            self.canvas.create_image(x, y, anchor=tk.NW, image=self.photo)
+            logger.debug(f"Imagen mostrada en el canvas: shape={resized.shape}, dtype={resized.dtype}")
+        else:
+            logger.warning(f"Dimensiones de imagen inválidas: {new_width}x{new_height}")
 
     def update_brightness(self, value: str) -> None:
-        self.history_manager.add_state(self.get_current_state())
         self.brightness = float(value)
         self.update_image()
+        self.history_manager.add_state(self.get_current_state())
 
     def update_contrast(self, value: str) -> None:
-        self.history_manager.add_state(self.get_current_state())
         self.contrast = float(value)
         self.update_image()
+        self.history_manager.add_state(self.get_current_state())
 
     def update_saturation(self, value: str) -> None:
-        self.history_manager.add_state(self.get_current_state())
         self.saturation = float(value)
         self.update_image()
+        self.history_manager.add_state(self.get_current_state())
 
     def update_grayscale(self) -> None:
-        self.history_manager.add_state(self.get_current_state())
         self.is_grayscale = self.grayscale_var.get()
         self.update_image()
+        self.history_manager.add_state(self.get_current_state())
 
     def rotate_image(self) -> None:
-        self.history_manager.add_state(self.get_current_state())
         self.angle += 90
         self.angle %= 360
         self.update_image()
+        self.history_manager.add_state(self.get_current_state())
 
     def zoom_in(self) -> None:
         self.zoom *= 1.2
@@ -513,14 +424,14 @@ class PhotoW:
             file_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=file_types)
             if file_path:
                 try:
-                    img_bytes = cv2.imencode('.png', self.cv_image)[1].tobytes()
                     processed = self.image_processor.process_image(
-                        img_bytes, self.brightness, self.contrast, 
+                        self.cv_image, self.brightness, self.contrast, 
                         self.saturation, self.angle, self.is_grayscale
                     )
                     cv2.imwrite(file_path, cv2.cvtColor(processed, cv2.COLOR_RGB2BGR))
                     messagebox.showinfo("Éxito", "Imagen guardada correctamente.")
                 except Exception as e:
+                    logger.error(f"No se pudo guardar la imagen: {str(e)}")
                     messagebox.showerror("Error", f"No se pudo guardar la imagen: {str(e)}")
         else:
             messagebox.showwarning("Advertencia", "No hay imagen para guardar.")
@@ -538,16 +449,16 @@ class PhotoW:
             canvas_width = self.canvas.winfo_width()
             canvas_height = self.canvas.winfo_height()
             
-            scale = min(canvas_width/img_width, canvas_height/img_height)
+            scale = min(canvas_width/img_width, canvas_height/img_height) * self.zoom
             
             x1 = max(0, int((start_x - (canvas_width - img_width*scale)/2) / scale))
             y1 = max(0, int((start_y - (canvas_height - img_height*scale)/2) / scale))
             x2 = min(img_width, int((end_x - (canvas_width - img_width*scale)/2) / scale))
             y2 = min(img_height, int((end_y - (canvas_height - img_height*scale)/2) / scale))
             
-            self.history_manager.add_state(self.get_current_state())
             self.cv_image = self.image_processor.crop_image(self.cv_image, x1, y1, x2, y2)
             self.update_image()
+            self.history_manager.add_state(self.get_current_state())
 
     def get_current_state(self) -> dict:
         return {
@@ -556,7 +467,8 @@ class PhotoW:
             'contrast': self.contrast,
             'saturation': self.saturation,
             'angle': self.angle,
-            'is_grayscale': self.is_grayscale
+            'is_grayscale': self.is_grayscale,
+            'zoom': self.zoom
         }
 
     def set_state(self, state: dict) -> None:
@@ -568,6 +480,7 @@ class PhotoW:
         self.saturation = state['saturation']
         self.angle = state['angle']
         self.is_grayscale = state['is_grayscale']
+        self.zoom = state['zoom']
         self._update_sliders()
         self.update_image()
 
@@ -582,10 +495,31 @@ class PhotoW:
         if state:
             self.set_state(state)
 
+def check_for_update(version: str, root: tk.Tk) -> bool:
+    updater = UpdateSystem(version)
+    new_version, download_url = updater.check_for_updates()
+    
+    if new_version and download_url:
+        if messagebox.askyesno("Actualización Disponible", 
+                               f"Hay una nueva versión disponible: {new_version}. ¿Desea descargarla?"):
+            update_file = updater.download_update(download_url)
+            if update_file:
+                if messagebox.askyesno("Actualización Descargada", 
+                                       f"La actualización ha sido descargada a:\n{update_file}\n\n¿Desea ejecutar el instalador ahora?"):
+                    root.quit()
+                    os.startfile(update_file)
+                    return True
+                else:
+                    messagebox.showinfo("Información", f"Puede instalar la actualización más tarde ejecutando:\n{update_file}")
+            else:
+                messagebox.showerror("Error", "No se pudo descargar la actualización.")
+        return False
+    return False
+
 def main():
     if sys.platform.startswith('win'):
         ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
-
+    
     root = ttk.Window("Photo-W")
     app = PhotoW(root)
     
