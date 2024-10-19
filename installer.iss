@@ -1,11 +1,11 @@
 #define MyAppName "Photo-W"
-#define MyAppVersion "1.5.0"
+#define MyAppVersion "1.6"
 #define MyAppPublisher "Wamphyre"
 #define MyAppURL "https://github.com/Wamphyre/Photo-W"
 #define MyAppExeName "Photo-W.exe"
 
 [Setup]
-AppId={{8FE86485-9BF5-4A0C-89E1-D1A7A13DF6FD}
+AppId={{2F2AFFD6-B9B6-4114-98AB-345DD98836E3}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
@@ -15,71 +15,53 @@ AppUpdatesURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=.
-OutputBaseFilename=Photo-W-Setup
-Compression=lzma
+OutputBaseFilename=Photo-W-Setup-x64
+SetupIconFile=icon.ico
+Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
+ArchitecturesAllowed=x64os
+ArchitecturesInstallIn64BitMode=x64os
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
-Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "dist\Photo-W\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\Photo-W\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion 64bit
+Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
+[Run]
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+
 [Registry]
+Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{#MyAppExeName}"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName}"; Flags: uninsdeletekey
 Root: HKCR; Subkey: ".jpg"; ValueType: string; ValueName: ""; ValueData: "Photo-W.Image"; Flags: uninsdeletevalue
 Root: HKCR; Subkey: ".jpeg"; ValueType: string; ValueName: ""; ValueData: "Photo-W.Image"; Flags: uninsdeletevalue
 Root: HKCR; Subkey: ".png"; ValueType: string; ValueName: ""; ValueData: "Photo-W.Image"; Flags: uninsdeletevalue
 Root: HKCR; Subkey: ".bmp"; ValueType: string; ValueName: ""; ValueData: "Photo-W.Image"; Flags: uninsdeletevalue
-Root: HKCR; Subkey: "Photo-W.Image"; ValueType: string; ValueName: ""; ValueData: "Photo-W Image"; Flags: uninsdeletekey
+Root: HKCR; Subkey: ".gif"; ValueType: string; ValueName: ""; ValueData: "Photo-W.Image"; Flags: uninsdeletevalue
+Root: HKCR; Subkey: ".tiff"; ValueType: string; ValueName: ""; ValueData: "Photo-W.Image"; Flags: uninsdeletevalue
+Root: HKCR; Subkey: "Photo-W.Image"; ValueType: string; ValueName: ""; ValueData: "Archivo de imagen Photo-W"; Flags: uninsdeletekey
 Root: HKCR; Subkey: "Photo-W.Image\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName},0"
 Root: HKCR; Subkey: "Photo-W.Image\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 
-[Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
-
 [Code]
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-var
-  mRes : integer;
+function Is64BitInstallMode: Boolean;
 begin
-  case CurUninstallStep of
-    usUninstall:
-      begin
-        mRes := MsgBox('¿Desea eliminar todos los archivos de configuración y datos de usuario?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2)
-        if mRes = IDYES then
-        begin
-          DelTree(ExpandConstant('{userappdata}\{#MyAppName}'), True, True, True);
-        end;
-      end;
-  end;
+  Result := Is64BitInstallMode;
 end;
 
-function InitializeSetup(): Boolean;
-var
-  UninstallKey: String;
-  UninstallString: String;
-  ResultCode: Integer;
+function IsWin64: Boolean;
 begin
-  Result := True;
-  
-  // Comprobar si existe una versión anterior
-  UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#SetupSetting("AppId")}_is1';
-  if RegQueryStringValue(HKLM, UninstallKey, 'UninstallString', UninstallString) then
-  begin
-    // Desinstalar la versión anterior
-    if MsgBox('Se detectó una versión anterior de {#MyAppName}. ¿Desea desinstalarla antes de continuar?', mbConfirmation, MB_YESNO) = IDYES then
-    begin
-      Exec(RemoveQuotes(UninstallString), '/SILENT', '', SW_SHOW, ewWaitUntilTerminated, ResultCode);
-    end;
-  end;
+  Result := IsWin64;
 end;
